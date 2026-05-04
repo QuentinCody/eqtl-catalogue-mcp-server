@@ -38,8 +38,20 @@ console.log(`${BLUE}🧪 eQTL Catalogue Structured Content Regression Tests${RES
 
 const toolExpectations = [
   {
-    path: 'src/tools/search.ts',
-    required: ['createCodeModeResponse', 'createCodeModeError'],
+    path: 'src/tools/code-mode.ts',
+    required: ['createSearchTool', 'createExecuteTool', 'eqtlCatalog'],
+  },
+  {
+    path: 'src/tools/query-data.ts',
+    required: ['createQueryDataHandler', 'eqtl_query_data', 'EQTL_DATA_DO'],
+  },
+  {
+    path: 'src/tools/get-schema.ts',
+    required: ['createGetSchemaHandler', 'eqtl_get_schema', 'EQTL_DATA_DO'],
+  },
+  {
+    path: 'src/spec/catalog.ts',
+    required: ['eqtlCatalog', 'ebi.ac.uk/eqtl/api'],
   },
 ];
 
