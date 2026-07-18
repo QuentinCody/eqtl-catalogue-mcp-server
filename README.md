@@ -2,7 +2,7 @@
 
 MCP server wrapping the [EBI eQTL Catalogue REST API](https://www.ebi.ac.uk/eqtl/api-docs/) — a resource of harmonised QTL associations across studies (GTEx, BLUEPRINT, eQTLGen, and more).
 
-Runs on Cloudflare Workers. Exposes four Code Mode tools (`eqtl_search`, `eqtl_execute`, `eqtl_query_data`, `eqtl_get_schema`) plus a thin `eqtl_search` convenience wrapper.
+Runs on Cloudflare Workers. Exposes four Code Mode tools: `eqtl_search`, `eqtl_execute`, `eqtl_query_data`, `eqtl_get_schema`.
 
 - Upstream docs: https://www.ebi.ac.uk/eqtl/api-docs/
 - Base URL: `https://www.ebi.ac.uk/eqtl/api`
