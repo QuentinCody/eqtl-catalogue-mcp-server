@@ -1,44 +1,49 @@
 import { describe, expect, it } from "vitest";
-import { normalizeEqtlParams } from "./api-adapter";
+import { parseEqtlPath } from "./api-adapter";
 
-describe("normalizeEqtlParams", () => {
-	it("maps a legacy rsID to the API v3 rsid parameter", () => {
-		expect(
-			normalizeEqtlParams("/associations", {
-				variant_id: "rs7903146",
-				size: 5,
-				quant_method: "ge",
-			}),
-		).toEqual({ rsid: "rs7903146", size: 5 });
-	});
-
-	it("maps a chr_pos_ref_alt identifier to the API v3 variant parameter", () => {
-		expect(
-			normalizeEqtlParams("/datasets/QTD000021/associations", {
-				snp: "10_114758349_C_T",
-				start: 20,
-			}),
-		).toEqual({ variant: "10_114758349_C_T", start: 20 });
-	});
-
-	it("preserves explicit API v3 filters and removes legacy-only filters", () => {
-		expect(
-			normalizeEqtlParams("/studies/QTS000002/associations", {
-				rsid: "rs7903146",
-				gene_id: "ENSG00000148737",
-				chromosome: "10",
-				tissue: "UBERON_0000178",
-				page: 2,
-			}),
-		).toEqual({
-			rsid: "rs7903146",
-			gene_id: "ENSG00000148737",
-			chromosome: "10",
+describe("parseEqtlPath", () => {
+	it("routes the metadata paths", () => {
+		expect(parseEqtlPath("/studies")).toEqual({ kind: "studies" });
+		expect(parseEqtlPath("/studies/QTS000002")).toEqual({
+			kind: "study",
+			studyId: "QTS000002",
+		});
+		expect(parseEqtlPath("/datasets")).toEqual({ kind: "datasets" });
+		expect(parseEqtlPath("/datasets/QTD000021")).toEqual({
+			kind: "dataset",
+			datasetId: "QTD000021",
 		});
 	});
 
-	it("does not rewrite metadata requests", () => {
-		const params = { size: 1 };
-		expect(normalizeEqtlParams("/studies", params)).toBe(params);
+	it("routes the three data paths", () => {
+		expect(parseEqtlPath("/datasets/QTD000021/region")).toEqual({
+			kind: "region",
+			datasetId: "QTD000021",
+		});
+		expect(parseEqtlPath("/datasets/QTD000021/top_associations")).toEqual({
+			kind: "top-associations",
+			datasetId: "QTD000021",
+		});
+		expect(parseEqtlPath("/datasets/QTD000021/credible_sets")).toEqual({
+			kind: "credible-sets",
+			datasetId: "QTD000021",
+		});
+	});
+
+	it("normalizes identifier case and a trailing query string", () => {
+		expect(parseEqtlPath("datasets/qtd000021/region?chromosome=20")).toEqual({
+			kind: "region",
+			datasetId: "QTD000021",
+		});
+	});
+
+	it("refuses the retired REST routes instead of guessing an equivalent", () => {
+		// /associations was the old API's cross-study search. The flat files are
+		// indexed by coordinate only, so there is nothing to map it onto and the
+		// caller must be told, not silently handed an empty result.
+		expect(parseEqtlPath("/associations")).toBeUndefined();
+		expect(parseEqtlPath("/studies/QTS000002/associations")).toBeUndefined();
+		expect(parseEqtlPath("/datasets/QTD000021/associations")).toBeUndefined();
+		expect(parseEqtlPath("/tissues")).toBeUndefined();
 	});
 });

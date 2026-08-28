@@ -21,7 +21,12 @@ export function registerCodeMode(server: McpServer, env: CodeModeEnv): void {
     const executeTool = createExecuteTool({
         prefix: "eqtl",
         // Verifiable provenance: eqtl_execute results carry a _meta.citation.
-        source: { id: "eqtl", name: "eQTL Catalogue", url: "https://www.ebi.ac.uk/eqtl", license: "CC BY 4.0" },
+        source: {
+            id: "eqtl",
+            name: "eQTL Catalogue (EBI FTP flat files)",
+            url: "https://www.ebi.ac.uk/eqtl/Data_access/",
+            license: "CC BY 4.0",
+        },
         catalog: eqtlCatalog,
         apiFetch,
         doNamespace: env.EQTL_DATA_DO,
