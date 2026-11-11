@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import zlib from "node:zlib";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EqtlDataset } from "./ftp-catalogue";
@@ -5,9 +6,10 @@ import type { EqtlDataset } from "./ftp-catalogue";
 // The unit under test is the reader, so its one I/O dependency is injected.
 // Everything below the mock — BGZF framing, the tabix index, line splitting,
 // filtering — is the real code.
-vi.mock("./http", () => ({ ebiFileFetch: vi.fn() }));
+vi.mock("@bio-mcp/shared/adapters/eqtl/http", () => ({ ebiFileFetch: vi.fn() }));
 
 import { ebiFileFetch } from "./http";
+import { createIndexedFileReader } from "./indexed-file";
 import { queryRegion, readTsvGz, resetFileCaches } from "./sumstats";
 
 const fetchMock = vi.mocked(ebiFileFetch);
@@ -152,13 +154,13 @@ const DATASET = {
  * A two-member BGZF file: the header line alone, then the data block the
  * index points at. The files upstream are CRLF-terminated, so this one is too.
  */
-function buildSumstatsFile(): { bytes: Uint8Array; dataOffset: number; dataLength: number } {
+function buildSumstatsFile(customRows?: string[]): { bytes: Uint8Array; dataOffset: number; dataLength: number } {
 	const header = bgzfMember(ENCODER.encode(`${NOMINAL_COLUMNS.join("\t")}\r\n`));
-	const dataText = [
+	const dataText = (customRows ?? [
 		nominalRow(WINDOW_START, "rs4239702"),
 		nominalRow(WINDOW_START + 1, "rs11121529"),
 		nominalRow(WINDOW_START + 400, "rs00000000"),
-	]
+	])
 		.map((row) => `${row}\r\n`)
 		.join("");
 	const data = bgzfMember(ENCODER.encode(dataText));
@@ -187,15 +189,17 @@ const COVERING_BINS: BinSpec[] = [
 ];
 
 /** Serve the synthesized index and file, honouring the Range the reader asks for. */
-function serveSumstats(bins: BinSpec[] = COVERING_BINS): void {
+function serveSumstats(bins: BinSpec[] = COVERING_BINS, file = FILE): void {
 	const tbi = tbiFor(bins);
 	fetchMock.mockImplementation(async (url: string, opts?: { range?: { start: number; end?: number } }) => {
 		if (url.endsWith(".tbi")) return new Response(tbi.slice());
 		const range = opts?.range;
 		const slice = range
-			? FILE.bytes.slice(range.start, range.end === undefined ? undefined : range.end + 1)
-			: FILE.bytes.slice();
-		return new Response(slice);
+			? file.bytes.slice(range.start, range.end === undefined ? undefined : range.end + 1)
+			: file.bytes.slice();
+		return new Response(slice, range ? { status: 206, headers: {
+			"Content-Range": `bytes ${range.start}-${Math.min(range.end ?? file.bytes.length - 1, file.bytes.length - 1)}/${file.bytes.length}`,
+		} } : undefined);
 	});
 }
 
@@ -344,6 +348,56 @@ describe("readTsvGz", () => {
 // ── queryRegion ──────────────────────────────────────────────────────────
 
 describe("queryRegion", () => {
+	it("runs the complete BGZF/tabix reader through isolated caller-supplied transports", async () => {
+		serveSumstats();
+		const serve = fetchMock.getMockImplementation()!;
+		fetchMock.mockReset();
+		const query = { dataset: DATASET, chromosome: "20", start: WINDOW_START, end: WINDOW_START };
+		const first = vi.fn(serve); const second = vi.fn(serve);
+		const firstIo = { ...createIndexedFileReader(first), fetchFile: first };
+		const a = await queryRegion(query, firstIo);
+		const b = await queryRegion(query, { ...createIndexedFileReader(second), fetchFile: second });
+		expect(a.rows).toEqual(b.rows); expect(a.rows.length).toBeGreaterThan(0);
+		expect(first).toHaveBeenCalledTimes(3); expect(second).toHaveBeenCalledTimes(3);
+		await queryRegion(query, firstIo);
+		expect(first).toHaveBeenCalledTimes(4); // Only the range is fetched again within one reader.
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+	it("preserves underflowing numeric text, NA and empty cells without conflating the originals", async () => {
+		const row = nominalRow(WINDOW_START, "rs4239702").replace("0.220888", "1e-400").replace("0.1\t0.05", "NA\t");
+		serveSumstats(COVERING_BINS, buildSumstatsFile([row]));
+		const result = await queryRegion({ dataset: DATASET, chromosome: "20", start: WINDOW_START, end: WINDOW_START });
+		expect(result.rows[0]).toMatchObject({ pvalue: 0, beta: null, se: null });
+		expect(result.raw_rows).toEqual([row]);
+	});
+
+	it("uses the virtual offset to skip a leading partial record, and refuses malformed complete rows", async () => {
+		const row = nominalRow(WINDOW_START, "rs4239702");
+		const prefix = "fragment\r\n";
+		const file = buildSumstatsFile([prefix + row]);
+		serveSumstats([{ bin: LEAF_BIN, chunks: [{ begin: file.dataOffset * 65536 + prefix.length, end: file.dataOffset * 65536 + file.dataLength }] }], file);
+		expect((await queryRegion({ dataset: DATASET, chromosome: "20", start: WINDOW_START, end: WINDOW_START })).raw_rows).toEqual([row]);
+		resetFileCaches();
+		serveSumstats(COVERING_BINS, buildSumstatsFile(["malformed\trow"]));
+		await expect(queryRegion({ dataset: DATASET, chromosome: "20", start: WINDOW_START, end: WINDOW_START })).rejects.toThrow(/row width/);
+	});
+	it("retains native rows and independent byte proofs through pinned repeat reads", async () => {
+		serveSumstats();
+		const query = { dataset: DATASET, chromosome: "20", start: WINDOW_START, end: WINDOW_START + 1 };
+		const result = await queryRegion(query);
+		const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+		expect(result.native_header).toBe(NOMINAL_COLUMNS.join("\t"));
+		expect(result.raw_rows).toEqual([nominalRow(WINDOW_START, "rs4239702"), nominalRow(WINDOW_START + 1, "rs11121529")]);
+		expect(result.coverage_complete).toBe(false);
+		expect(result.file_evidence.index.sha256).toBe(hash(tbiFor(COVERING_BINS)));
+		expect(result.file_evidence.header.sha256).toBe(hash(FILE.bytes));
+		expect(result.file_evidence.range?.sha256).toBe(hash(FILE.bytes.slice(FILE.dataOffset)));
+		const pins = { index_sha256: result.file_evidence.index.sha256, header_sha256: result.file_evidence.header.sha256, range_sha256: result.file_evidence.range!.sha256 };
+		expect((await queryRegion({ ...query, ...pins })).raw_rows).toEqual(result.raw_rows);
+		for (const key of Object.keys(pins)) {
+			await expect(queryRegion({ ...query, ...pins, [key]: "0".repeat(64) })).rejects.toMatchObject({ status: 409 });
+		}
+	});
 	it("returns the rows inside the window and stops at the first row past it", async () => {
 		serveSumstats();
 		const result = await queryRegion({
@@ -404,7 +458,7 @@ describe("queryRegion", () => {
 		).rejects.toMatchObject({ status: 400, message: /invalid region/ });
 	});
 
-	it("returns a verified zero when the index itself covers no block in the window", async () => {
+	it("reports an index with no covering block without claiming exhaustive absence", async () => {
 		serveSumstats();
 		const far = 1_000_000;
 		const result = await queryRegion({
@@ -416,5 +470,8 @@ describe("queryRegion", () => {
 		expect(result.row_count).toBe(0);
 		expect(result.lines_scanned).toBe(0);
 		expect(result.byte_range).toBeNull();
+		expect(result.raw_rows).toEqual([]);
+		expect(result.file_evidence.range).toBeNull();
+		expect(result.coverage_complete).toBe(false);
 	});
 });

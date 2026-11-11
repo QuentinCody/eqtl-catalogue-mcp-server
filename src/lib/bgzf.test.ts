@@ -69,6 +69,9 @@ describe("bgzfBlockSize", () => {
 });
 
 describe("inflateGzipMember", () => {
+	it("rejects a gzip bomb exceeding the BGZF uncompressed member limit", async () => {
+		await expect(inflateGzipMember(bgzfMember("x".repeat(65537)))).rejects.toThrow(/exceeds 65536/);
+	});
 	it("round-trips a single BGZF member", async () => {
 		const out = await inflateGzipMember(bgzfMember("one\ttwo\n"));
 		expect(new TextDecoder().decode(out)).toBe("one\ttwo\n");
@@ -93,6 +96,16 @@ describe("inflateBgzf", () => {
 });
 
 describe("readBgzfLines", () => {
+	it("does not turn a range ending mid-row into a complete record", async () => {
+		const seen: string[] = [];
+		await readBgzfLines(bodyOf(concat([bgzfMember("complete\npartial"), bgzfMember(" row\n").slice(0, 20)])), line => { seen.push(line); });
+		expect(seen).toEqual(["complete"]);
+	});
+
+	it("bounds a row spanning many valid members", async () => {
+		const member = bgzfMember("x".repeat(65536));
+		await expect(readBgzfLines(new Response(concat(Array(17).fill(member))).body!, () => {})).rejects.toThrow(/line exceeds 1 MiB/);
+	});
 	it("emits lines across member boundaries", async () => {
 		const bytes = concat([bgzfMember("a\tb\nc\t"), bgzfMember("d\ne\tf\n")]);
 		const seen: string[] = [];

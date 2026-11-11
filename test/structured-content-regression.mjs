@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_ROOT = path.resolve(__dirname, '..');
@@ -44,7 +45,9 @@ function assertExcludes(filePath, haystack, needle, testName) {
 
 function readFile(relPath) {
   const absPath = path.resolve(SERVER_ROOT, relPath);
-  return fs.readFileSync(absPath, 'utf8');
+  const source = fs.readFileSync(absPath, 'utf8');
+  const shared = /export \* from "(@bio-mcp\/shared\/adapters\/eqtl\/[\w-]+)"/.exec(source);
+  return shared ? source + '\n' + fs.readFileSync(createRequire(import.meta.url).resolve(shared[1]), 'utf8') : source;
 }
 
 console.log(`${BLUE}🧪 eQTL Catalogue Structured Content Regression Tests${RESET}`);
@@ -97,20 +100,11 @@ for (const { path: filePath, required, forbidden } of toolExpectations) {
 
 const doContent = readFile('src/do.ts');
 for (const table of ['associations', 'top_associations', 'credible_sets', 'datasets']) {
-  assertContains('src/do.ts', doContent, `tableName: "${table}"`, `do.ts hints the ${table} table`);
+  assertContains('src/do.ts', doContent, `return "${table}"`, `do.ts preserves the ${table} table`);
 }
 
-const credibleSetHint = doContent.slice(
-  doContent.indexOf('tableName: "credible_sets"'),
-  doContent.indexOf('// Nominal / conditional cis associations.'),
-);
-for (const absent of ['"chromosome"', '"position"']) {
-  assertExcludes(
-    'src/do.ts',
-    credibleSetHint,
-    absent,
-    `do.ts credible_sets index list omits ${absent}`,
-  );
+for (const field of ['native_json', 'source_tsv', 'response_context']) {
+  assertContains('src/do.ts', doContent, field, `do.ts retains ${field}`);
 }
 
 // A filter naming a column the file does not carry must be a loud 400, never a

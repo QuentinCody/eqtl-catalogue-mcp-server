@@ -1,6 +1,11 @@
 import type { ApiFetchFn } from "@bio-mcp/shared/codemode/catalog";
+import { betaMetadataRoute } from "./beta-catalogue";
 import { type EqtlDataset, filterDatasets, loadDatasets, summarizeStudies } from "./ftp-catalogue";
+import { type ParquetEnv, queryParquet } from "./parquet";
+import { assertR7Snapshot, r7SnapshotPins } from "./r7-snapshot";
+import { eqtlError, hashParam, releases, selectRelease } from "./release";
 import { clampMaxRows, queryRegion, readTsvGz } from "./sumstats";
+import { metadataSnapshot } from "./metadata-snapshot";
 
 /**
  * Routes the isolate's `api.get(...)` calls onto the eQTL Catalogue's static
@@ -10,6 +15,10 @@ import { clampMaxRows, queryRegion, readTsvGz } from "./sumstats";
  */
 
 export type EqtlRoute =
+	| { kind: "releases" }
+	| { kind: "metadata-snapshot" }
+	| { kind: "files"; datasetId: string }
+	| { kind: "parquet-schema"; datasetId: string }
 	| { kind: "datasets" }
 	| { kind: "dataset"; datasetId: string }
 	| { kind: "region"; datasetId: string }
@@ -19,6 +28,8 @@ export type EqtlRoute =
 	| { kind: "study"; studyId: string };
 
 const SUB_ROUTES: Record<string, EqtlRoute["kind"]> = {
+	files: "files",
+	parquet_schema: "parquet-schema",
 	region: "region",
 	top_associations: "top-associations",
 	credible_sets: "credible-sets",
@@ -30,6 +41,8 @@ export function parseEqtlPath(path: string): EqtlRoute | undefined {
 		.split("?")[0]
 		.split("/")
 		.filter((segment) => segment.length > 0);
+	if (segments.length === 1 && segments[0] === "releases") return { kind: "releases" };
+	if (segments.length === 2 && segments[0] === "discovery" && segments[1] === "metadata_snapshot") return { kind: "metadata-snapshot" };
 	if (segments[0] === "datasets") {
 		if (segments.length === 1) return { kind: "datasets" };
 		const datasetId = segments[1].toUpperCase();
@@ -51,15 +64,17 @@ export function parseEqtlPath(path: string): EqtlRoute | undefined {
 	return undefined;
 }
 
-function badRequest(message: string): Error & { status: number } {
-	const error = new Error(message) as Error & { status: number };
+function badRequest(message: string): Error & { status: number; data: unknown } {
+	const error = new Error(message) as Error & { status: number; data: unknown };
 	error.status = 400;
+	error.data = { source: "eqtl", status: 400, message };
 	return error;
 }
 
-function notFound(message: string): Error & { status: number } {
-	const error = new Error(message) as Error & { status: number };
+function notFound(message: string): Error & { status: number; data: unknown } {
+	const error = new Error(message) as Error & { status: number; data: unknown };
 	error.status = 404;
+	error.data = { source: "eqtl", status: 404, message };
 	return error;
 }
 
@@ -74,10 +89,10 @@ function getInteger(params: Record<string, unknown> | undefined, name: string): 
 	const text = getString(params, name);
 	if (text === undefined) return undefined;
 	const value = Number(text.replace(/[,_]/g, ""));
-	if (!Number.isFinite(value)) {
-		throw badRequest(`eQTL Catalogue: ${name} must be a number (got "${text}")`);
+	if (!Number.isSafeInteger(value)) {
+		throw badRequest(`eQTL Catalogue: ${name} must be a safe integer (got "${text}")`);
 	}
-	return Math.trunc(value);
+	return value;
 }
 
 function getNumber(params: Record<string, unknown> | undefined, name: string): number | undefined {
@@ -155,7 +170,7 @@ async function handleStudy(studyId: string) {
 	if (members.length === 0) {
 		throw notFound(`eQTL Catalogue: no study ${studyId} in the r7 release`);
 	}
-	return { ...summarizeStudies(members)[0], datasets: members };
+	return { release: "r7", assembly: "GRCh38", ...summarizeStudies(members)[0], datasets: members };
 }
 
 async function handleRegion(datasetId: string, params: Record<string, unknown> | undefined) {
@@ -171,6 +186,9 @@ async function handleRegion(datasetId: string, params: Record<string, unknown> |
 	}
 	const result = await queryRegion({
 		dataset,
+		index_sha256: hashParam(params?.index_sha256, "index_sha256"),
+		header_sha256: hashParam(params?.header_sha256, "header_sha256"),
+		range_sha256: hashParam(params?.range_sha256, "range_sha256"),
 		chromosome,
 		start,
 		end,
@@ -256,18 +274,39 @@ async function handleCredibleSets(datasetId: string, params: Record<string, unkn
 
 function datasetContext(dataset: EqtlDataset) {
 	return {
-		dataset_id: dataset.dataset_id,
-		study_id: dataset.study_id,
-		study_label: dataset.study_label,
-		quant_method: dataset.quant_method,
-		tissue_label: dataset.tissue_label,
-		condition_label: dataset.condition_label,
-		sample_size: dataset.sample_size,
+		release: "r7",
+		assembly: "GRCh38",
+		...dataset,
 	};
 }
 
-export function createEqtlApiFetch(): ApiFetchFn {
+async function r7Route(route: EqtlRoute, params: Record<string, unknown>) {
+	const pins = r7SnapshotPins(params);
+	if (route.kind === "parquet-schema") eqtlError("parquet_schema requires release r8_beta");
+	const datasets = await loadDatasets();
+	const catalogue_snapshot = assertR7Snapshot(datasets[0]?.catalogue_snapshot, pins);
+	const data = await r7Data(route, params);
+	return { status: 200, data: { ...data, catalogue_snapshot } };
+}
+
+async function r7Data(route: EqtlRoute, params: Record<string, unknown>) {
+	switch (route.kind) {
+		case "files":
+			return { release: "r7", assembly: "GRCh38", dataset: await resolveDataset(route.datasetId), format: "bgzip/tabix" };
+		case "datasets": return handleDatasets(params);
+		case "dataset": return datasetContext(await resolveDataset(route.datasetId));
+		case "studies": return handleStudies(params);
+		case "study": return handleStudy(route.studyId);
+		case "region": return handleRegion(route.datasetId, params);
+		case "top-associations": return handleTopAssociations(route.datasetId, params);
+		case "credible-sets": return handleCredibleSets(route.datasetId, params);
+		default: return eqtlError("unsupported r7 route");
+	}
+}
+
+export function createEqtlApiFetch(env: ParquetEnv = {}): ApiFetchFn {
 	return async (request) => {
+		if (request.body !== undefined) eqtlError("GET request bodies are not supported");
 		if (request.method.toUpperCase() !== "GET") {
 			throw badRequest(
 				`eQTL Catalogue: ${request.method} is not supported — the catalogue is a read-only file tree`,
@@ -282,22 +321,27 @@ export function createEqtlApiFetch(): ApiFetchFn {
 			);
 		}
 
-		const params = request.params;
-		switch (route.kind) {
-			case "datasets":
-				return { status: 200, data: await handleDatasets(params) };
-			case "dataset":
-				return { status: 200, data: await resolveDataset(route.datasetId) };
-			case "studies":
-				return { status: 200, data: await handleStudies(params) };
-			case "study":
-				return { status: 200, data: await handleStudy(route.studyId) };
-			case "region":
-				return { status: 200, data: await handleRegion(route.datasetId, params) };
-			case "top-associations":
-				return { status: 200, data: await handleTopAssociations(route.datasetId, params) };
-			case "credible-sets":
-				return { status: 200, data: await handleCredibleSets(route.datasetId, params) };
+		const params = { ...request.params };
+		const query = request.path.split("?")[1];
+		if (query) for (const [key, value] of new URLSearchParams(query)) {
+			if (params[key] !== undefined) eqtlError(`duplicate query parameter ${key}`);
+			params[key] = value;
 		}
+		const release = selectRelease(params);
+		for (const name of ["index_sha256", "header_sha256", "range_sha256"]) {
+			if (params[name] !== undefined) {
+				if (release !== "r7" || route.kind !== "region") eqtlError(`${name} applies only to r7 /region`);
+				hashParam(params[name], name);
+			}
+		}
+		if (route.kind === "releases") return { status: 200, data: releases };
+		if (route.kind === "metadata-snapshot") return { status: 200, data: await metadataSnapshot(params) };
+		if (release === "r8_beta") {
+			if (params.paths_sha256 !== undefined) eqtlError("paths_sha256 applies only to the r7 file map");
+			const data = ["region", "top-associations", "credible-sets", "parquet-schema"].includes(route.kind)
+				? await queryParquet(route, params, env) : await betaMetadataRoute(route, params);
+			return { status: 200, data };
+		}
+		return r7Route(route, params);
 	};
 }

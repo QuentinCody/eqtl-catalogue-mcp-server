@@ -1,14 +1,15 @@
 import { buildHealthResponse, configureCitationSigning } from "@bio-mcp/shared";
-import { StatelessMcpWorker } from "@bio-mcp/shared/mcp";
-import { McpServer } from "@bio-mcp/shared/mcp";
-import { registerQueryData } from "./tools/query-data";
-import { registerGetSchema } from "./tools/get-schema";
-import { registerCodeMode } from "./tools/code-mode";
+import { McpServer, StatelessMcpWorker } from "@bio-mcp/shared/mcp";
 import { EqtlDataDO } from "./do";
+import type { ParquetEnv } from "./lib/parquet";
+import { registerCodeMode } from "./tools/code-mode";
+import { registerGetSchema } from "./tools/get-schema";
+import { registerQueryData } from "./tools/query-data";
+import { registerMetadataSnapshot } from "./tools/metadata-snapshot";
 
 export { EqtlDataDO };
 
-interface EqtlEnv {
+interface EqtlEnv extends ParquetEnv {
     EQTL_DATA_DO: DurableObjectNamespace;
     CODE_MODE_LOADER: WorkerLoader;
 }
@@ -25,6 +26,7 @@ export class MyMCP extends StatelessMcpWorker {
         const env = this.env as unknown as EqtlEnv;
         registerQueryData(this.server, env);
         registerGetSchema(this.server, env);
+        registerMetadataSnapshot(this.server, env);
         registerCodeMode(this.server, env);
     }
 }

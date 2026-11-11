@@ -5,7 +5,7 @@ describe("eqtlCatalog", () => {
 	it("points at the FTP file tree, not the retired REST API", () => {
 		// https://www.ebi.ac.uk/eqtl/api/v3/* answers HTTP 410.
 		expect(eqtlCatalog.baseUrl).toBe("https://ftp.ebi.ac.uk/pub/databases/spot/eQTL");
-		expect(eqtlCatalog.version).toBe("r7");
+		expect(eqtlCatalog.version).toBe("r7 + r8_beta");
 		// The notes name the dead API on purpose; no endpoint may target it.
 		expect(JSON.stringify(eqtlCatalog.endpoints)).not.toContain("ebi.ac.uk/eqtl/api");
 	});
@@ -20,6 +20,10 @@ describe("eqtlCatalog", () => {
 			"/datasets/{dataset_id}/region",
 			"/datasets/{dataset_id}/top_associations",
 			"/datasets/{dataset_id}/credible_sets",
+   "/discovery/metadata_snapshot",
+   "/releases",
+			"/datasets/{dataset_id}/files",
+			"/datasets/{dataset_id}/parquet_schema",
 		]);
 		expect(eqtlCatalog.endpointCount).toBe(paths.length);
 		expect(paths).not.toContain("/associations");

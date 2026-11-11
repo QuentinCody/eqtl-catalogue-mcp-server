@@ -1,4 +1,5 @@
 import type { ApiCatalog, ApiEndpoint } from "@bio-mcp/shared/codemode/catalog";
+import { parquetParams, releaseEndpoints, releaseParams } from "./releases";
 
 /**
  * The eQTL Catalogue's REST API was retired — every route under
@@ -97,7 +98,7 @@ const endpoints: ApiEndpoint[] = [
 	{
 		method: "GET",
 		path: "/studies",
-		summary: "List the 42 studies in the released catalogue (r7).",
+		summary: "List studies in the selected release (r7 by default).",
 		category: "metadata",
 		queryParams: [
 			{
@@ -130,7 +131,7 @@ const endpoints: ApiEndpoint[] = [
 	{
 		method: "GET",
 		path: "/datasets",
-		summary: "List and filter the 758 datasets, with the FTP file URLs for each.",
+		summary: "List datasets in one release; r7 includes file URLs, r8 includes raw metadata and snapshot provenance.",
 		category: "metadata",
 		queryParams: datasetFilters,
 		responseShape:
@@ -144,7 +145,7 @@ const endpoints: ApiEndpoint[] = [
 	{
 		method: "GET",
 		path: "/datasets/{dataset_id}",
-		summary: "One dataset record, including its resolved file URLs.",
+		summary: "One release-specific dataset record. For r8 Parquet links call /files.",
 		category: "metadata",
 		pathParams: [
 			{
@@ -160,7 +161,7 @@ const endpoints: ApiEndpoint[] = [
 		method: "GET",
 		path: "/datasets/{dataset_id}/region",
 		summary:
-			"Nominal cis associations in a GRCh38 window, read through the dataset's tabix index.",
+			"Nominal cis associations in a GRCh38 window: r7 tabix or checksum-pinned r8 Parquet.",
 		category: "associations",
 		pathParams: [
 			{
@@ -190,13 +191,17 @@ const endpoints: ApiEndpoint[] = [
 				description: "Window end, 1-based inclusive. Span limit 5,000,000 bp.",
 			},
 			...rowFilters,
+			...(["index_sha256", "header_sha256", "range_sha256"] as const).map(name => ({
+				name, type: "string" as const, required: false,
+				description: "r7 /region only: optional lowercase SHA-256 from file_evidence for the same query; reject changed response bytes.",
+			})),
 		],
 		responseShape:
 			"{ dataset, columns[], rows: [{ molecular_trait_id, chromosome, position, ref, alt, variant, ma_samples, maf, pvalue, beta, se, type, ac, an, r2, molecular_trait_object_id, gene_id, median_tpm, rsid }], row_count, truncated, byte_range, source_file, index_file }",
 		example:
 			'const hits = await api.get("/datasets/QTD000021/region", { chromosome: "20", start: 46120612, end: 46120613 });',
 		usageHint:
-			"Coordinate-indexed only. To answer a gene or rsID question, resolve it to GRCh38 coordinates first (ensembl_execute, gnomad, or gwas-catalog), then pass a window and narrow with gene_id/rsid.",
+			"Coordinate-indexed only. To answer a gene or rsID question, resolve it to GRCh38 coordinates first (ensembl_execute, gnomad, or gwas-catalog), then pass a window and narrow with gene_id/rsid. r7 returns native_header and aligned raw_rows preserving numeric text (CRLF normalized), plus file_evidence hashes of the complete compressed index/header-range/region-range HTTP bodies. Header evidence covers the first up-to-64 KiB response, not just the header line. coverage_complete is false: independently fetched files and row limits do not establish exhaustive absence. Region compressed reads are capped at 16 MiB, inflated data at 64 MiB; narrow the window if exceeded.",
 		featured: true,
 	},
 	{
@@ -295,23 +300,32 @@ const endpoints: ApiEndpoint[] = [
 			'const cs = await api.get("/datasets/QTD000021/credible_sets", { min_pip: 0.5, max_rows: 100 });',
 		usageHint:
 			"These files are ~10 MB and carry no index, so the whole file is streamed and filtered. Always pass min_pip or a trait filter, and expect a slower call than /region. " +
-			'There is NO chromosome or position column here — the set\'s locus is the "region" column (chrN:start-end). Passing chromosome or position is rejected with a 400 rather than answered with an empty result; slice coordinates with /region instead.',
+			'For r7 there is NO chromosome or position column — the set\'s locus is "region" (chrN:start-end); coordinate filters are rejected. For r8 inspect parquet_schema: filters are checked against the actual imported file.',
 	},
 ];
 
+for (const endpoint of endpoints) {
+	endpoint.queryParams = [...releaseParams, ...(endpoint.queryParams ?? [])];
+	if (endpoint.category === "associations" || endpoint.category === "fine-mapping") {
+		endpoint.queryParams.push(...parquetParams);
+		endpoint.usageHint = `${endpoint.usageHint ?? ""} r8_beta uses a configured Parquet service with max_rows <= 5000, a 30-second query deadline and a 2 MiB response budget; it preserves duplicate rows. Pin both checksums. Return staging/error handles intact.`;
+	}
+}
+endpoints.push(...releaseEndpoints);
+
 export const eqtlCatalog: ApiCatalog = {
-	name: "EBI eQTL Catalogue (FTP flat files + tabix)",
+	name: "EBI eQTL Catalogue (r7 tabix + r8 beta Parquet)",
 	baseUrl: "https://ftp.ebi.ac.uk/pub/databases/spot/eQTL",
-	version: "r7",
+	version: "r7 + r8_beta",
 	auth: "none",
 	endpointCount: endpoints.length,
 	notes:
 		"- SUBSTRATE: the eQTL Catalogue REST API is RETIRED — https://www.ebi.ac.uk/eqtl/api/v3/* returns HTTP 410. This server reads the static bgzip/tabix files on https://ftp.ebi.ac.uk/pub/databases/spot/eQTL and the metadata tables in the eQTL-Catalogue-resources repository. Do not try to call the old /associations route; it does not exist here.\n" +
 		"- COORDINATES ONLY: the association files are tabix-indexed by GRCh38 position. There is no gene-keyed or rsID-keyed lookup across studies. Resolve a symbol or rsID to coordinates first (ensembl_execute /lookup or /variation, gnomad, gwas-catalog), then call /datasets/{id}/region and narrow with gene_id or rsid.\n" +
 		"- FILES DIFFER PER DATASET: quant_method ge, microarray and aptamer publish .all.tsv.gz (306 datasets); exon, tx, txrev and leafcutter publish .cc.tsv.gz (452 datasets). Both carry the same 19 columns and a .tbi. The URLs come from the upstream path table, so read sumstats_url / permuted_url / credible_sets_url off the dataset record rather than assembling a filename.\n" +
-		"- RELEASE r7: 758 datasets across 42 studies. The r8 metadata table describes datasets that are not on the FTP tree yet, so this server tracks r7.\n" +
-		"- RATE LIMIT: EBI blacklists IPs that issue frequent tabix-style requests. Every upstream read here is serialized at ~1.5 s apart and indexes are cached. Keep fan-out to a handful of datasets per program, and prefer /top_associations over /region when you only need lead variants.\n" +
-		"- COST: /region is 1 range GET once the ~2 MB index and the header line are cached (3 requests cold). /top_associations is 1 whole-file GET of 0.5-2 MB. /credible_sets streams ~10 MB.\n" +
+		"- RELEASE: r7 is the default TSV path. Pass catalogue_snapshot.metadata_sha256 and paths_sha256 back on r7 reads to reject metadata/file-map drift before association access; these are not association-file hashes. Opt in with release r8_beta for the mutable Parquet pre-release (GTEx v10 and other new analyses). Final r8 is scheduled for December 2026. Dataset IDs are reused across releases: NEVER join solely on ID. Inspect /releases and /datasets/{id}/files. r8 queries require a configured query service plus metadata_sha256 and file_sha256 from its import manifest. Schema/filters come from actual Parquet files; no r7 column assumptions. ALT is the effect allele; retain multi-rsid/duplicate rows.\n" +
+		"- RATE LIMIT: EBI blacklists IPs that issue frequent tabix-style requests. FTP reads use a shared policy at 2 s apart and indexes are cached. Keep fan-out to a handful of datasets per program, and prefer /top_associations over /region when you only need lead variants.\n" +
+		"- COST: /region is 1 range GET once the ~2 MB index and the header line are cached (3 requests cold). Whole-file TSV reads are bounded to 16 MiB compressed / 64 MiB inflated, preserve native_header and aligned raw_rows, and report file_evidence for the complete compressed bytes. A hash does not establish complete parsed rows; inspect truncated.\n" +
 		"- FILTERS ARE CHECKED AGAINST THE FILE HEADER: a filter naming a column the file does not carry is answered with a 400 that lists the real columns. An empty result from this server therefore means the data is empty, not that the filter was misspelled.\n" +
 		"- Large results are staged automatically; query them with eqtl_query_data.",
 	endpoints,
@@ -322,17 +336,20 @@ export const eqtlCatalog: ApiCatalog = {
 				"Slice the same GRCh38 position out of several non-GTEx datasets and keep the significant hits.",
 			keywords: ["variant", "colocalisation", "immune", "region", "rsid"],
 			code: `// Coordinates must be resolved upstream — these files have no rsID index.
-const { datasets } = await api.get("/datasets", { study_label: "BLUEPRINT", quant_method: "ge" });
+const catalogue = await api.get("/datasets", { release: "r7", study_label: "BLUEPRINT", quant_method: "ge" });
+if (!Array.isArray(catalogue.datasets) || !catalogue.catalogue_snapshot) return catalogue;
+const { metadata_sha256, paths_sha256 } = catalogue.catalogue_snapshot;
 const out = [];
-for (const d of datasets.slice(0, 3)) {
+for (const d of catalogue.datasets.slice(0, 3)) {
   const slice = await api.get(\`/datasets/\${d.dataset_id}/region\`, {
+    release: "r7", metadata_sha256, paths_sha256,
     chromosome: "20", start: 46120612, end: 46120613, max_rows: 100,
   });
-  for (const row of slice.rows) {
-    if (row.pvalue !== null && row.pvalue < 1e-4) {
-      out.push({ dataset: d.dataset_id, tissue: d.tissue_label, ...row });
-    }
-  }
+  if (!Array.isArray(slice.rows)) { out.push({ dataset: d, result: slice }); continue; }
+  const selected = slice.rows.map((row, index) => ({ row, index })).filter(({ row }) => row.pvalue !== null && row.pvalue < 1e-4);
+  const rows = selected.map(({ row }) => row);
+  const raw_rows = selected.map(({ index }) => slice.raw_rows[index]);
+  out.push({ ...slice, rows, raw_rows, row_count: rows.length, source_row_count: slice.row_count, selection: "pvalue < 1e-4 within returned slice" });
 }
 return out;`,
 		},
@@ -341,10 +358,13 @@ return out;`,
 			description:
 				"Read the permuted top-hit file and keep traits below an empirical p-value.",
 			keywords: ["top hits", "permuted", "p_beta", "cis-QTL"],
-			code: `const top = await api.get("/datasets/QTD000021/top_associations", {
-  p_beta_max: 1e-6, max_rows: 500,
+			code: `const dataset = await api.get("/datasets/QTD000021", { release: "r7" });
+if (!dataset.catalogue_snapshot) return dataset;
+const { metadata_sha256, paths_sha256 } = dataset.catalogue_snapshot;
+const top = await api.get("/datasets/QTD000021/top_associations", {
+  release: "r7", metadata_sha256, paths_sha256, p_beta_max: 1e-6, max_rows: 500,
 });
-return { columns: top.columns, truncated: top.truncated, rows: top.rows };`,
+return top;`,
 		},
 	],
 };
